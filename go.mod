@@ -1,4 +1,4 @@
-module github.com/StevenACoffman/dsiface
+module github.com/StevenACoffman/dsifake
 
 go 1.14
 

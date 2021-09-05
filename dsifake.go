@@ -1,275 +1,329 @@
-// Package dsifake implements a fake dsiface.Client
-// If you make changes to existing code, please test whether it breaks
-// existing clients, e.g. in etl-gardener.
+// Package dsifake implements a fake Datastore
+// per https://github.com/googleapis/google-cloud-go/blob/master/testing.md
+// The crude key value store does not currently support transactions
 package dsifake
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
-	"reflect"
+	"net"
+	"os"
+	"os/signal"
+	"strconv"
 	"sync"
+	"syscall"
 
 	"cloud.google.com/go/datastore" //nolint:depguard // gke ≠ webapp
-	"github.com/googleapis/google-cloud-go-testing/datastore/dsiface"
+	"google.golang.org/api/option"
+	datastorepb "google.golang.org/genproto/googleapis/datastore/v1"
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 )
 
-// NOTE: This is over-restrictive, but fine for current purposes.
-func validateDatastoreEntity(e interface{}) error {
-	v := reflect.ValueOf(e)
-	if v.Kind() != reflect.Ptr {
-		return datastore.ErrInvalidEntityType
-	}
-	// NOTE: This is over-restrictive, but fine for current purposes.
-	if reflect.Indirect(v).Kind() != reflect.Struct {
-		return datastore.ErrInvalidEntityType
-	}
-	return nil
-}
+// ErrNotImplemented is returned if a dsifake function is unimplemented.
+// var ErrNotImplemented = errors.New("not implemented")
 
-// ErrNotImplemented is returned if a dsiface function is unimplemented.
-var ErrNotImplemented = errors.New("not implemented")
-
-// Client implements a crude datastore test client.  It is somewhat
+// FakeDatastore implements a crude datastore test client.  It is somewhat
 // simplistic and incomplete.  It works only for basic Put, Get, and Delete,
 // but may not always work correctly.
-type Client struct {
-	dsiface.Client // For unimplemented methods
-	lock           sync.Mutex
-	objects        map[datastore.Key][]byte
+type FakeDatastore struct {
+	datastorepb.UnimplementedDatastoreServer // For unimplemented methods
+	lock                                     sync.Mutex
+	objects                                  map[string][]byte
 }
 
-// NewClient returns a fake client that satisfies dsiface.Client.
-func NewClient() *Client {
+// NewClient returns a fake client that uses the FakeDatastore.
+func NewClient(ctx context.Context) (*datastore.Client, *FakeDatastore) {
+	cctx, cancel := context.WithCancel(ctx)
+	// defer cancel()
 	if flag.Lookup("test.v") == nil {
 		log.Fatal("DSFakeClient should only be used in tests")
 	}
-	return &Client{objects: make(map[datastore.Key][]byte, 10)}
-}
 
-// Close implements dsiface.Client.Close
-func (c *Client) Close() error { return nil }
-
-// Count implements dsiface.Client.Count
-func (c *Client) Count(ctx context.Context, q *datastore.Query) (n int, err error) {
-	return 0, ErrNotImplemented
-}
-
-// Delete implements dsiface.Client.Delete
-func (c *Client) Delete(ctx context.Context, key *datastore.Key) error {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	_, ok := c.objects[*key]
-	if !ok {
-		return datastore.ErrNoSuchEntity
-	}
-	delete(c.objects, *key)
-	return nil
-}
-
-// Get implements dsiface.Client.Get
-func (c *Client) Get(ctx context.Context, key *datastore.Key, dst interface{}) (err error) {
-	err = validateDatastoreEntity(dst)
+	// Setup the fake server.
+	fakeDatastore := &FakeDatastore{objects: make(map[string][]byte, 10)}
+	l, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
-		return err
+		panic(err)
 	}
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	o, ok := c.objects[*key]
-	if !ok {
-		return datastore.ErrNoSuchEntity
-	}
-	return json.Unmarshal(o, dst)
-}
+	gsrv := grpc.NewServer()
+	datastorepb.RegisterDatastoreServer(gsrv, fakeDatastore)
+	fakeServerAddr := l.Addr().String()
 
-type multiArgType int
-
-const (
-	multiArgTypeInvalid multiArgType = iota
-	multiArgTypePropertyLoadSaver
-	multiArgTypeStruct
-	multiArgTypeStructPtr
-	multiArgTypeInterface
-)
-
-var (
-	typeOfPropertyLoadSaver = reflect.TypeOf((*datastore.PropertyLoadSaver)(nil)).Elem()
-	typeOfPropertyList      = reflect.TypeOf(datastore.PropertyList(nil))
-)
-
-// checkMultiArg checks that v has type []S, []*S, []I, or []P, for some struct
-// type S, for some interface type I, or some non-interface non-pointer type P
-// such that P or *P implements PropertyLoadSaver.
-//
-// It returns what category the slice's elements are, and the reflect.Type
-// that represents S, I or P.
-//
-// As a special case, PropertyList is an invalid type for v.
-func checkMultiArg(v reflect.Value) (m multiArgType, elemType reflect.Type) {
-	// TODO(djd): multiArg is very confusing. Fold this logic into the
-	// relevant Put/Get methods to make the logic less opaque.
-	if v.Kind() != reflect.Slice {
-		return multiArgTypeInvalid, nil
-	}
-	if v.Type() == typeOfPropertyList {
-		return multiArgTypeInvalid, nil
-	}
-	elemType = v.Type().Elem()
-	if reflect.PtrTo(elemType).Implements(typeOfPropertyLoadSaver) {
-		return multiArgTypePropertyLoadSaver, elemType
-	}
-	switch elemType.Kind() {
-	case reflect.Struct:
-		return multiArgTypeStruct, elemType
-	case reflect.Interface:
-		return multiArgTypeInterface, elemType
-	case reflect.Ptr:
-		elemType = elemType.Elem()
-		if elemType.Kind() == reflect.Struct {
-			return multiArgTypeStructPtr, elemType
+	go func() {
+		if err := gsrv.Serve(l); err != nil {
+			panic(err)
 		}
-	}
-	return multiArgTypeInvalid, nil
-}
+	}()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		s := <-sigCh
+		log.Printf("got signal %v, attempting graceful shutdown", s)
+		cancel()
+		gsrv.GracefulStop()
+		// grpc.Stop() // leads to error while receiving stream response: rpc error: code =
+		// Unavailable desc = transport is closing
+	}()
 
-// valid returns whether the key is valid.
-func valid(k *datastore.Key) bool {
-	if k == nil {
-		return false
-	}
-	for ; k != nil; k = k.Parent {
-		if k.Kind == "" {
-			return false
-		}
-		if k.Name != "" && k.ID != 0 {
-			return false
-		}
-		if k.Parent != nil {
-			if k.Parent.Incomplete() {
-				return false
-			}
-			if k.Parent.Namespace != k.Namespace {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-// GetMulti is a batch version of Get.
-//
-// dst must be a []S, []*S, []I or []P, for some struct type S, some interface
-// type I, or some non-interface non-pointer type P such that P or *P
-// implements PropertyLoadSaver. If an []I, each element must be a valid dst
-// for Get: it must be a struct pointer or implement PropertyLoadSaver.
-//
-// As a special case, PropertyList is an invalid type for dst, even though a
-// PropertyList is a slice of structs. It is treated as invalid to avoid being
-// mistakenly passed when []PropertyList was intended.
-//
-// err may be a MultiError. See ExampleMultiError to check it.
-func (c *Client) GetMulti(ctx context.Context, keys []*datastore.Key, dst interface{}) (err error) {
-	fmt.Printf("%+v\n", c.objects)
-	v := reflect.ValueOf(dst)
-	multiArgType, _ := checkMultiArg(v)
-
-	// Sanity checks
-	if multiArgType == multiArgTypeInvalid {
-		return errors.New("datastore: dst has invalid type")
-	}
-	if len(keys) != v.Len() {
-		return errors.New("datastore: keys and dst slices have different length")
-	}
-	if len(keys) == 0 {
-		return nil
-	}
-
-	// Go through keys and validate them,
-	multiErr, any := make(datastore.MultiError, len(keys)), false
-	for i, k := range keys {
-		if !valid(k) {
-			multiErr[i] = datastore.ErrInvalidKey
-			any = true
-		} else if k.Incomplete() {
-			multiErr[i] = fmt.Errorf("datastore: can't get the incomplete key: %v", k)
-			any = true
-		}
-	}
-	if any {
-		return multiErr
-	}
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	for index := range keys {
-		value, ok := c.objects[*keys[index]]
-		if ok {
-			elem := v.Index(index)
-			if multiArgType == multiArgTypePropertyLoadSaver ||
-				multiArgType == multiArgTypeStruct {
-				elem = elem.Addr()
-			}
-			if multiArgType == multiArgTypeStructPtr && elem.IsNil() {
-				elem.Set(reflect.New(elem.Type().Elem()))
-			}
-			if jsonErr := json.Unmarshal(value, elem.Interface()); jsonErr != nil {
-				multiErr[index] = jsonErr
-				any = true
-			}
-		} else {
-			multiErr[index] = datastore.ErrNoSuchEntity
-			any = true
-		}
-	}
-
-	if any {
-		return multiErr
-	}
-	return nil
-}
-
-// Put implements dsiface.Client.Put
-func (c *Client) Put(
-	_ context.Context,
-	key *datastore.Key,
-	src interface{},
-) (*datastore.Key, error) {
-	err := validateDatastoreEntity(src)
+	// Create a client.
+	client, err := datastore.NewClient(cctx,
+		"dsfake",
+		option.WithEndpoint(fakeServerAddr),
+		option.WithoutAuthentication(),
+		option.WithGRPCDialOption(grpc.WithInsecure()),
+	)
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
-	js, err := json.Marshal(src)
-	if err != nil {
-		return nil, err
-	}
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	c.objects[*key] = js
-	return key, nil
+
+	return client, fakeDatastore
 }
 
-// GetKeys lists all keys saved in the fake client.
-func (c *Client) GetKeys() []datastore.Key {
+// GetDSKeys lists all keys saved in the fake client.
+func (c *FakeDatastore) GetDSKeys() []*datastore.Key {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	keys := make([]datastore.Key, len(c.objects))
+	keys := make([]*datastore.Key, len(c.objects))
 	i := 0
-	for k := range c.objects {
-		keys[i] = k
+	for _, v := range c.objects {
+		var e datastorepb.Entity
+		if err := proto.Unmarshal(v, &e); err != nil {
+			continue
+		}
+
+		keys[i] = protoToKey(e.Key)
 		i++
 	}
 
 	return keys
 }
 
-func (c *Client) GetMap() map[datastore.Key][]byte {
+func (c *FakeDatastore) GetMap() map[string][]byte {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	newMap := make(map[datastore.Key][]byte, 10)
+	newMap := make(map[string][]byte, 10)
 	for k, v := range c.objects {
 		newMap[k] = v
 	}
 	return c.objects
 }
+
+// Commit - While this is a no-op, we need to satisfy the expectations for unmarshalling
+func (c *FakeDatastore) Commit(
+	_ context.Context,
+	in *datastorepb.CommitRequest,
+) (*datastorepb.CommitResponse, error) {
+	keys := make([]*datastorepb.Key, 0, len(in.GetMutations()))
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	// c.OutputObjects()
+	for _, v := range in.GetMutations() {
+		switch op := v.GetOperation().(type) {
+		case *datastorepb.Mutation_Update:
+			pbKey := op.Update.Key
+
+			_, ok := c.objects[protoKeyToKeyName(pbKey)]
+			if ok {
+				if b, marshalErr := proto.Marshal(op.Update); marshalErr == nil {
+					keys = append(keys, pbKey)
+					c.objects[protoKeyToKeyName(pbKey)] = b
+				}
+			}
+
+		case *datastorepb.Mutation_Upsert:
+			pbKey := op.Upsert.Key
+			if b, err := proto.Marshal(op.Upsert); err == nil {
+				keys = append(keys, pbKey)
+				c.objects[protoKeyToKeyName(pbKey)] = b
+			}
+
+		case *datastorepb.Mutation_Delete:
+			pbKey := op.Delete
+			_, ok := c.objects[protoKeyToKeyName(pbKey)]
+			if ok {
+				keys = append(keys, op.Delete)
+				delete(c.objects, protoKeyToKeyName(pbKey))
+			}
+
+		}
+	}
+
+	var mutationResults []*datastorepb.MutationResult
+	for i := range keys {
+		mutationResult := datastorepb.MutationResult{
+			Key:              keys[i],
+			Version:          0,
+			ConflictDetected: false,
+		}
+		mutationResults = append(mutationResults, &mutationResult)
+	}
+
+	response := datastorepb.CommitResponse{
+		MutationResults: mutationResults,
+		IndexUpdates:    0,
+	}
+	// c.OutputObjects()
+	return &response, nil
+}
+
+func (c *FakeDatastore) Lookup(
+	_ context.Context,
+	in *datastorepb.LookupRequest,
+) (*datastorepb.LookupResponse, error) {
+	pbKeys := in.GetKeys()
+	found := make([]*datastorepb.EntityResult, 0, len(pbKeys))
+	var missing []*datastorepb.EntityResult
+	response := datastorepb.LookupResponse{
+		Found:    nil,
+		Missing:  nil,
+		Deferred: nil,
+	}
+
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	// c.OutputObjects()
+
+	for i := range pbKeys {
+		v, ok := c.objects[protoKeyToKeyName(pbKeys[i])]
+		if ok {
+			var e datastorepb.Entity
+			if err := proto.Unmarshal(v, &e); err != nil {
+				missing = append(missing, entityResultFromKey(pbKeys[i]))
+				continue
+			}
+
+			found = append(found, entityResultFromEntity(&e))
+		} else {
+			missing = append(missing, entityResultFromKey(pbKeys[i]))
+		}
+	}
+	response.Found = found
+	response.Missing = missing
+
+	return &response, nil
+}
+
+// OutputObjects is useful for debugging
+func (c *FakeDatastore) OutputObjects() {
+	fmt.Fprintln(os.Stdout,"------------start")
+	for k, v := range c.objects {
+		var e datastorepb.Entity
+		if err := proto.Unmarshal(v, &e); err != nil {
+			fmt.Fprintln(os.Stdout, "unmarshal error for key:", k, " error:", err)
+		} else {
+			fmt.Fprintln(os.Stdout, "key: ", k, "value: ", e.String())
+		}
+	}
+	fmt.Fprintln(os.Stdout,"------------end")
+}
+
+func entityResultFromKey(pbkey *datastorepb.Key) *datastorepb.EntityResult {
+	e := &datastorepb.Entity{
+		Key: pbkey,
+	}
+	er := &datastorepb.EntityResult{
+		Entity:  e,
+		Version: 0, // TODO:Dunno what this is supposed to be
+		Cursor:  nil,
+	}
+	return er
+}
+
+func entityResultFromEntity(e *datastorepb.Entity) *datastorepb.EntityResult {
+	er := &datastorepb.EntityResult{
+		Entity:  e,
+		Version: 0, // TODO:Dunno what this is supposed to be
+		Cursor:  nil,
+	}
+	return er
+}
+
+// protoKeyToKeyName decodes a protocol buffer representation of a key into an
+// equivalent *datastore.Key string.
+func protoKeyToKeyName(p *datastorepb.Key) string {
+	var namespace string
+	if partition := p.PartitionId; partition != nil {
+		namespace = partition.NamespaceId
+	}
+	keyName, kind := getKeyNameAndKindFromPath(p.Path)
+
+	return fmt.Sprintf("%s/%s/%s", namespace, kind, keyName)
+}
+
+func getKeyNameAndKindFromPath(path []*datastorepb.Key_PathElement) (name string, kind string) {
+	for _, el := range path {
+		kind = el.Kind
+		name = el.GetName()
+		if name != "" &&  el.GetId() != 0 {
+			name = strconv.FormatInt(el.GetId(), 10)
+		}
+	}
+	return name, kind
+}
+
+func protoToKey(p *datastorepb.Key) *datastore.Key {
+	var key *datastore.Key
+	var namespace string
+	if partition := p.PartitionId; partition != nil {
+		namespace = partition.NamespaceId
+	}
+	for _, el := range p.Path {
+		key = &datastore.Key{
+			Namespace: namespace,
+			Kind:      el.Kind,
+			ID:        el.GetId(),
+			Name:      el.GetName(),
+			Parent:    key,
+		}
+	}
+
+	return key
+}
+
+// WhyInvalidKey returns why the key is valid. useful for debugging
+func WhyInvalidKey(k *datastore.Key) {
+	if k == nil {
+		fmt.Fprintln(os.Stdout, "\n**key was nil")
+	}
+	for ; k != nil; k = k.Parent {
+		if k.Kind == "" {
+			fmt.Fprintln(os.Stdout, "\n**key had empty Kind")
+		}
+		if k.Name != "" && k.ID != 0 {
+			fmt.Fprintln(os.Stdout, "\n**key had empty Name or ID = 0")
+		}
+
+		if k.Parent != nil {
+			if k.Parent.Incomplete() {
+				fmt.Fprintln(os.Stdout, "\n**key had incomplete parent")
+			}
+			if k.Parent.Namespace != k.Namespace {
+				fmt.Fprintln(os.Stdout, "\n**key had different namespace from parent")
+			}
+		}
+	}
+}
+
+/* TODO(steve): implement remaining methods as necessary
+
+func (c *FakeDatastore) RunQuery(context.Context, *datastorepb.RunQueryRequest) (*datastorepb.RunQueryResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RunQuery not implemented")
+}
+func (c *FakeDatastore) BeginTransaction(context.Context, *datastorepb.BeginTransactionRequest) (*datastorepb.BeginTransactionResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method BeginTransaction not implemented")
+}
+
+func (c *FakeDatastore) Rollback(context.Context, *datastorepb.RollbackRequest) (*datastorepb.RollbackResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Rollback not implemented")
+}
+func (c *FakeDatastore) AllocateIds(context.Context, *datastorepb.AllocateIdsRequest) (*datastorepb.AllocateIdsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method AllocateIds not implemented")
+}
+func (c *FakeDatastore) ReserveIds(context.Context, *datastorepb.ReserveIdsRequest) (*datastorepb.ReserveIdsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ReserveIds not implemented")
+}
+
+*/

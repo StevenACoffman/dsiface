@@ -1,6 +1,7 @@
 package dsifake
 
 import (
+	"context"
 	"log"
 	"testing"
 
@@ -24,7 +25,8 @@ type Object struct {
 }
 
 func TestDSFake(t *testing.T) {
-	client := NewClient()
+	ctx := context.Background()
+	client, fakeDS := NewClient(ctx)
 
 	const kind = "TestDSFake"
 	const namespace = "dsfake"
@@ -32,34 +34,30 @@ func TestDSFake(t *testing.T) {
 	k1.Namespace = namespace
 	k2 := datastore.NameKey(kind, "o2", nil)
 	k2.Namespace = namespace
-	// this key does not get put on purpose!
+	// this key is not Put on purpose!
 	k3 := datastore.NameKey(kind, "o3", nil)
 	k3.Namespace = namespace
 
 	o1 := Object{"o1"}
-	_, err := client.Put(nil, k1, &o1)
+	_, err := client.Put(ctx, k1, &o1)
+
 	must(t, err)
 
 	var o1a Object
-	// This should fail because it o1a isn't a pointer
-	err = client.Get(nil, k1, o1a)
-	if err != datastore.ErrInvalidEntityType {
-		t.Error("Should detect non-pointer")
-	}
 
-	must(t, client.Get(nil, k1, &o1a))
+	must(t, client.Get(ctx, k1, &o1a))
 	if o1a.Value != o1.Value {
 		t.Fatal("Failed put/get", o1a, o1)
 	}
 
 	// A second object should not interfere with the first.
 	o2 := Object{"o2"}
-	_, err = client.Put(nil, k2, &o2)
+	_, err = client.Put(ctx, k2, &o2)
 	must(t, err)
 
 	// Check that Get still fetches the correct o1 value
 	var o1b Object
-	must(t, client.Get(nil, k1, &o1b))
+	must(t, client.Get(ctx, k1, &o1b))
 	if o1b.Value != o1.Value {
 		t.Fatal("Apparent object collision", o1b, o1)
 	}
@@ -67,30 +65,33 @@ func TestDSFake(t *testing.T) {
 	o2.Value = "local-o2"
 	// Check that changing original object doesn't change the stored value.
 	var o2a Object
-	must(t, client.Get(nil, k2, &o2a))
+	must(t, client.Get(ctx, k2, &o2a))
 	if o2a.Value != "o2" {
 		t.Error("Changing local modifies persisted value", o2a.Value, "!=", "o2")
 	}
 
-	keys := client.GetKeys()
+	keys := fakeDS.GetDSKeys()
+
 	if len(keys) != 2 {
 		t.Fatal("Should be 2 keys")
 	}
-	if keys[0] != *k1 && keys[1] != *k1 {
+	if keys[0].Name != k1.Name && keys[1].Name != k1.Name {
 		t.Error("Missing key1", k1, "\n", keys[0], "\n", keys[1])
 	}
-	if keys[0] != *k2 && keys[1] != *k2 {
+	if keys[0].Name != k2.Name && keys[1].Name != k2.Name {
 		t.Error("Missing key2", *k2, "\n", keys[0], "\n", keys[1])
 	}
 
 	// test GetMulti
 	var keysToMultiGet []*datastore.Key
 	for i := range keys {
-		keysToMultiGet = append(keysToMultiGet, &keys[i])
+		key := datastore.NameKey(kind, keys[i].Name, nil)
+		key.Namespace = namespace
+		keysToMultiGet = append(keysToMultiGet, key)
 	}
 	keysToMultiGet = append(keysToMultiGet, k3)
 	objs := make([]Object, len(keysToMultiGet))
-	err = client.GetMulti(nil, keysToMultiGet, objs)
+	err = client.GetMulti(ctx, keysToMultiGet, objs)
 	numNotFounds := 0
 	if err != nil {
 		if mErr, ok := err.(datastore.MultiError); ok {
@@ -118,8 +119,8 @@ func TestDSFake(t *testing.T) {
 	}
 
 	// Test Delete()
-	must(t, client.Delete(nil, k1))
-	err = client.Get(nil, k1, &o1b)
+	must(t, client.Delete(ctx, k1))
+	err = client.Get(ctx, k1, &o1b)
 	if err != datastore.ErrNoSuchEntity {
 		t.Fatal("delete failed")
 	}
